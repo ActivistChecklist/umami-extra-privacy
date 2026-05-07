@@ -1,24 +1,25 @@
 # @activistchecklist/umami-extra-privacy
 
-Server-side relay for [Umami](https://umami.is/) analytics with configurable
-IP anonymization. Drop-in handlers for Fastify, Next.js, and any Node HTTP
-framework.
+This packages adds a thin layer of additional privacy features on top of Umami [Umami](https://umami.is/) analytics.
 
-The point: you don't trust the Umami client-side script with raw visitor IPs.
-Instead, the browser POSTs to your own API route, your server anonymizes the
-IP, and your server forwards the event to Umami over an authenticated channel.
+* Sends Umami requests to a server-side API before sending them to the actual Umami instance. (Can be self-hosted or use Umami Cloud). This gives us control over what we send, and ensures that our user is never connecting to a server other than ours, for maximum privacy.
+* (Optional) Trims off some data from the IP address so you can still get the user's approximate location without ever sending it to the server. (This is the `geo-hash` option.)
 
-## What this gives you
+**Why does this matter?** If your Umami database is turned over to law enforcement, you now no longer have the exact IP addresses of your visitors. There is plausible deniability that any given person actually viewed your site.
 
-- **6 anonymization levels** from `none` to `drop`, including a geo-preserving
+**Doesn't Umami already obfuscate the IP addresses?** Yes, Umami generates a hash of IP addresses rather than storing the original. But if someone knows your APP_SECRET, the user agent, and the IP address, they can reverse engineer the hash and determine if a particular user was on your site. Using `hash` or `geo-hash`.
+
+## What this package includes
+
+* **6 anonymization levels** from `none` to `drop`, including a geo-preserving
   daily-rotating hash.
-- **Cloud and self-hosted Umami** support — auto-detected from environment
+* **Cloud and self-hosted Umami** support — auto-detected from environment
   variables.
-- **Adapters** for Fastify, Next.js App Router, and a generic
+* **Adapters** for Fastify, Next.js App Router, and a generic
   `(input) => result` handler you can wire into anything.
-- **Browser helper** that posts to your relay endpoint and silently swallows
+* **Browser helper** that posts to your relay endpoint and silently swallows
   failures (analytics should never break the page).
-- **No bundled middleware**: rate limiting, CORS, and security headers are
+* **No bundled middleware**: rate limiting, CORS, and security headers are
   intentionally left to your app.
 
 ## Install
@@ -61,21 +62,21 @@ Pass via the `level` option. Default: `geo-hash`.
 | Level | IPv4 behavior | IPv6 behavior | Geo info | Reversible? |
 |---|---|---|---|---|
 | `none` | unchanged | unchanged | full | yes (passes raw IP) |
-| `mask24` | last octet zeroed (`/24`) | last 5 groups zeroed (`/48`) | coarse | no |
-| `mask16` | last two octets zeroed (`/16`) | last 4 groups zeroed (`/64`) | very coarse | no |
+| `mask24` | last octet zeroed (`/24`) | last 5 groups zeroed (`/48`) | very coarse | no |
+| `mask16` | last two octets zeroed (`/16`) | last 4 groups zeroed (`/64`) | coarse | no |
 | `geo-hash` | first 2 octets kept, top 3 bits of octet 3 kept, rest randomized via salted hash | first 3 groups kept, group 4 randomized via salted hash | coarse | no |
 | `hash` | full 64-char SHA-256 hex (no IP shape) | full 64-char SHA-256 hex | none | no |
 | `drop` | omitted from payload | omitted from payload | none | n/a |
 
 Notes:
 
-- For `hash` and `geo-hash`, you must provide a salt. Default `rotation` is
+* For `hash` and `geo-hash`, you must provide a salt. Default `rotation` is
   `daily`, so the hash for a given IP changes once per UTC day. Options are
   `daily` / `hourly` / `none`.
-- `geo-hash` deliberately preserves enough information for Umami's IP-to-geo
+* `geo-hash` deliberately preserves enough information for Umami's IP-to-geo
   lookup to land in the right country/region while making per-visitor tracking
   impractical. If you don't need geo, prefer `hash` or `drop`.
-- Invalid IP strings (junk, IPv6 with embedded IPv4, malformed IPv6) pass
+* Invalid IP strings (junk, IPv6 with embedded IPv4, malformed IPv6) pass
   through unchanged for `mask*` levels and are still hashed for `hash` /
   `geo-hash`.
 
@@ -164,20 +165,20 @@ throwing.
 
 For advanced use, the package exports:
 
-- `anonymizeIp(ip, options)` — pure anonymization, no I/O
-- `sendUmamiEvent({ config, payload, userAgent })` — pure send, no IP handling
-- `resolveConfigFromEnv(env?)` — env → `UmamiConfig | null`
-- `extractClientIp(headers, fallback?)` — leftmost XFF / X-Real-IP / fallback
+* `anonymizeIp(ip, options)` — pure anonymization, no I/O
+* `sendUmamiEvent({ config, payload, userAgent })` — pure send, no IP handling
+* `resolveConfigFromEnv(env?)` — env → `UmamiConfig | null`
+* `extractClientIp(headers, fallback?)` — leftmost XFF / X-Real-IP / fallback
 
 ## Security notes
 
-- Never log raw IPs anywhere upstream of this handler. Anonymization happens
+* Never log raw IPs anywhere upstream of this handler. Anonymization happens
   inside the handler — if you log the request body or raw socket address
   before calling the handler, you've leaked.
-- The `IP_HASH_SALT` should be a cryptographically random server-only secret.
+* The `IP_HASH_SALT` should be a cryptographically random server-only secret.
   If it leaks, the daily rotation is your only remaining protection against
   rainbow-table reversal of the hash.
-- The package does not bundle CORS, helmet, or rate limiting. Configure those
+* The package does not bundle CORS, helmet, or rate limiting. Configure those
   on your app — see your framework's docs.
 
 ## License
