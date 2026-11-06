@@ -14,9 +14,10 @@ import {
 export interface CounterHandlerOptions {
   /** Anonymization level applied to the client IP. Default: `geo-hash`. */
   level?: AnonymizationLevel;
-  /** Salt for hashing levels. Falls back to `IP_HASH_SALT` env var. */
-  salt?: string;
-  /** How often the salt rotates. Default: `daily`. */
+  /**
+   * How long each in-memory key for the hashing levels lasts before it is
+   * thrown away. Default: `daily`.
+   */
   rotation?: SaltRotation;
   /** Umami credentials. If omitted, resolved from `UMAMI_*` env vars. */
   config?: UmamiConfig;
@@ -24,7 +25,7 @@ export interface CounterHandlerOptions {
   env?: NodeJS.ProcessEnv;
   /** Inject a fetch implementation (mostly for testing). */
   fetchImpl?: typeof fetch;
-  /** Inject a clock (mostly for testing the rotation salt). */
+  /** Inject a clock (mostly for testing key rotation). */
   now?: () => Date;
 }
 
@@ -72,7 +73,6 @@ export type CounterResult =
 export function createCounterHandler(options: CounterHandlerOptions = {}) {
   const level: AnonymizationLevel = options.level ?? 'geo-hash';
   const env = options.env ?? process.env;
-  const salt = options.salt ?? env.IP_HASH_SALT;
   const rotation = options.rotation ?? 'daily';
   const config = options.config ?? resolveConfigFromEnv(env);
 
@@ -110,18 +110,11 @@ export function createCounterHandler(options: CounterHandlerOptions = {}) {
       };
     }
 
-    let anonymizedIp: string | null = null;
-    try {
-      anonymizedIp = anonymizeIp(input.ip, {
-        level,
-        salt,
-        rotation,
-        now: options.now,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { success: false, status: 500, error: msg };
-    }
+    const anonymizedIp = anonymizeIp(input.ip, {
+      level,
+      rotation,
+      now: options.now,
+    });
 
     const payload: UmamiPayload = {
       url,

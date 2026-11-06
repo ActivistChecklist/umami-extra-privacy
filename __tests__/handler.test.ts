@@ -109,35 +109,32 @@ describe('createCounterHandler', () => {
     expect(sent.payload.ip).toBeUndefined();
   });
 
-  it('reads salt from env (IP_HASH_SALT)', async () => {
+  it('sends a geo-hash stand-in from the same /19 by default, with no salt set', async () => {
     const { fetchImpl, calls } = captureFetch();
-    const handle = createCounterHandler({
-      config: cloudConfig,
-      level: 'hash',
-      env: { IP_HASH_SALT: 'env-salt' },
-      fetchImpl,
-    });
+    const handle = createCounterHandler({ config: cloudConfig, env: {}, fetchImpl });
     const result = await handle({
-      ip: '1.2.3.4',
+      ip: '203.0.113.42',
       body: { url: '/', hostname: 'h' },
     });
     expect(result.success).toBe(true);
     const sent = JSON.parse(calls[0]!.init.body as string);
-    expect(sent.payload.ip).toMatch(/^[0-9a-f]{64}$/);
+    const [a, b, c] = String(sent.payload.ip).split('.').map(Number);
+    expect([a, b, c! & 0xe0]).toEqual([203, 0, 113 & 0xe0]);
   });
 
-  it('returns 500 when hashing level lacks salt', async () => {
+  it('omits ip when the address does not parse', async () => {
+    const { fetchImpl, calls } = captureFetch();
     const handle = createCounterHandler({
       config: cloudConfig,
-      level: 'hash',
-      env: {},
+      level: 'mask24',
+      fetchImpl,
     });
-    const result = await handle({
-      ip: '1.2.3.4',
+    await handle({
+      ip: 'unknown',
       body: { url: '/', hostname: 'h' },
     });
-    expect(result.success).toBe(false);
-    if (!result.success) expect(result.status).toBe(500);
+    const sent = JSON.parse(calls[0]!.init.body as string);
+    expect(sent.payload.ip).toBeUndefined();
   });
 
   it('returns 502 when sendUmamiEvent fails', async () => {

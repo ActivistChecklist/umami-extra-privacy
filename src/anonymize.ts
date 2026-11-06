@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
+import { isIPv4 as netIsIPv4, isIPv6 as netIsIPv6 } from 'node:net';
 
 export type AnonymizationLevel =
   | 'none'
@@ -8,115 +9,197 @@ export type AnonymizationLevel =
   | 'hash'
   | 'drop';
 
+/** How long one random key lasts before it is thrown away. */
 export type SaltRotation = 'daily' | 'hourly' | 'none';
 
 export interface AnonymizeOptions {
   level: AnonymizationLevel;
-  salt?: string;
   rotation?: SaltRotation;
   now?: () => Date;
 }
 
-function rotationKey(rotation: SaltRotation, now: Date): string {
+// How much of the real address `geo-hash` keeps, so a GeoLite2 lookup on the
+// stand-in still lands near the visitor. The bits after these are shuffled
+// with the period's key. For IPv6 only bits 28-63 are shuffled and the
+// interface ID (bits 64-127) is zeroed.
+const GEO_KEEP_V4 = 19;
+const GEO_KEEP_V6 = 28;
+
+// ---------- keys ----------
+
+interface PeriodKey {
+  period: string;
+  key: Buffer;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+// One random key per rotation mode. Keys exist only in this process's memory:
+// they are never derived from a secret, written anywhere or logged. When a
+// period ends its key is wiped, so nobody (us included) can recompute that
+// period's stand-ins from a real address. A restart also starts a new key, so
+// a visitor who is active across a restart shows up as two sessions that day.
+const keys = new Map<SaltRotation, PeriodKey>();
+
+function periodOf(rotation: SaltRotation, now: Date): string {
   if (rotation === 'none') return '';
-  const y = now.getUTCFullYear();
-  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(now.getUTCDate()).padStart(2, '0');
+  const iso = now.toISOString();
+  return rotation === 'hourly' ? iso.slice(0, 13) : iso.slice(0, 10);
+}
+
+function msUntilNextPeriod(rotation: SaltRotation, now: Date): number | null {
+  if (rotation === 'none') return null;
+  const next = new Date(now.getTime());
   if (rotation === 'hourly') {
-    const h = String(now.getUTCHours()).padStart(2, '0');
-    return `${y}-${m}-${d}T${h}`;
-  }
-  return `${y}-${m}-${d}`;
-}
-
-function hashIp(ip: string, salt: string, rotationSalt: string): string {
-  return createHash('sha256').update(ip + rotationSalt + salt).digest('hex');
-}
-
-function isIPv4(ip: string): boolean {
-  const parts = ip.split('.');
-  if (parts.length !== 4) return false;
-  return parts.every((p) => {
-    const n = Number(p);
-    return Number.isInteger(n) && n >= 0 && n <= 255 && String(n) === p;
-  });
-}
-
-function isIPv6(ip: string): boolean {
-  return ip.includes(':');
-}
-
-function stripIPv6Zone(ip: string): string {
-  const idx = ip.indexOf('%');
-  return idx === -1 ? ip : ip.slice(0, idx);
-}
-
-function expandIPv6(ip: string): string[] | null {
-  const cleaned = stripIPv6Zone(ip);
-  if (cleaned.includes('.')) {
-    return null;
-  }
-  const parts = cleaned.split('::');
-  if (parts.length > 2) return null;
-
-  let head: string[] = [];
-  let tail: string[] = [];
-
-  if (parts.length === 1) {
-    head = parts[0]!.split(':');
+    next.setUTCMinutes(60, 0, 0);
   } else {
-    head = parts[0] === '' ? [] : parts[0]!.split(':');
-    tail = parts[1] === '' ? [] : parts[1]!.split(':');
+    next.setUTCHours(24, 0, 0, 0);
   }
+  return next.getTime() - now.getTime();
+}
 
-  const total = head.length + tail.length;
-  if (total > 8) return null;
-  if (parts.length === 1 && total !== 8) return null;
+function discardKey(rotation: SaltRotation): void {
+  const entry = keys.get(rotation);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.key.fill(0);
+  keys.delete(rotation);
+}
 
-  const fillCount = 8 - total;
-  const groups = [...head, ...Array(fillCount).fill('0'), ...tail];
+function keyFor(rotation: SaltRotation, now: Date): Buffer {
+  const period = periodOf(rotation, now);
+  const current = keys.get(rotation);
+  if (current && current.period === period) return current.key;
+  discardKey(rotation);
 
-  for (const g of groups) {
-    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+  const entry: PeriodKey = { period, key: randomBytes(32) };
+  const msLeft = msUntilNextPeriod(rotation, now);
+  if (msLeft !== null) {
+    // Wipe the key when its period ends even if no request arrives to replace
+    // it. unref() so the timer never keeps the process alive.
+    entry.timer = setTimeout(() => {
+      if (keys.get(rotation) === entry) discardKey(rotation);
+    }, msLeft);
+    entry.timer.unref?.();
   }
-  return groups.map((g) => g.toLowerCase().padStart(4, '0'));
+  keys.set(rotation, entry);
+  return entry.key;
 }
 
-function maskIPv4(ip: string, keepOctets: 2 | 3): string | null {
-  if (!isIPv4(ip)) return null;
-  const parts = ip.split('.');
-  if (keepOctets === 3) return `${parts[0]}.${parts[1]}.${parts[2]}.0`;
-  return `${parts[0]}.${parts[1]}.0.0`;
+// ---------- parsing ----------
+
+interface ParsedIp {
+  version: 4 | 6;
+  value: bigint;
 }
 
-function maskIPv6(ip: string, keepGroups: 3 | 4): string | null {
-  const groups = expandIPv6(ip);
-  if (!groups) return null;
-  const kept = groups.slice(0, keepGroups);
-  const zeroed = Array(8 - keepGroups).fill('0');
-  return [...kept, ...zeroed].map((g) => g.replace(/^0+(?=.)/, '')).join(':');
+function ipv4ToBigInt(ip: string): bigint {
+  return ip
+    .split('.')
+    .reduce((acc, octet) => (acc << 8n) | BigInt(Number(octet)), 0n);
 }
 
-function geoHashIPv4(ip: string, salt: string, rotationSalt: string): string {
-  const parts = ip.split('.');
-  const userHash = hashIp(ip, salt, rotationSalt);
-  const thirdInt = Number(parts[2]);
-  const thirdHigh = thirdInt & 0xe0;
-  const thirdRandom = parseInt(userHash.slice(0, 2), 16) & 0x1f;
-  const anonThird = thirdHigh | thirdRandom;
-  const anonFourth = parseInt(userHash.slice(2, 6), 16) % 256;
-  return `${parts[0]}.${parts[1]}.${anonThird}.${anonFourth}`;
+function ipv6ToBigInt(ip: string): bigint | null {
+  if (!netIsIPv6(ip)) return null;
+  let text = ip;
+  // A dotted IPv4 tail (::ffff:1.2.3.4) becomes the last two hex groups.
+  const lastColon = text.lastIndexOf(':');
+  const tail = text.slice(lastColon + 1);
+  if (tail.includes('.')) {
+    const v4 = ipv4ToBigInt(tail);
+    text =
+      text.slice(0, lastColon + 1) +
+      (v4 >> 16n).toString(16) +
+      ':' +
+      (v4 & 0xffffn).toString(16);
+  }
+  const halves = text.split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const rest = halves.length > 1 && halves[1] ? halves[1].split(':') : [];
+  const groups = [...head, ...Array(8 - head.length - rest.length).fill('0'), ...rest];
+  return groups.reduce((acc, g) => (acc << 16n) | BigInt(parseInt(g, 16)), 0n);
 }
 
-function geoHashIPv6(ip: string, salt: string, rotationSalt: string): string {
-  const groups = expandIPv6(ip);
-  if (!groups) return ip;
-  const userHash = hashIp(ip, salt, rotationSalt);
-  const kept = groups.slice(0, 3);
-  const fourth = userHash.slice(0, 4);
-  return [...kept, fourth, '0', '0', '0', '0']
-    .map((g) => g.replace(/^0+(?=.)/, ''))
-    .join(':');
+/**
+ * Parse an address the way proxies hand it over: plain IPv4 or IPv6, an IPv6
+ * zone ID, `[v6]` or `[v6]:port`, or `v4:port`. IPv4-mapped IPv6
+ * (`::ffff:1.2.3.4`) is an IPv4 visitor, so it comes back as IPv4. Anything
+ * else is null, so it never reaches Umami unchanged.
+ */
+function parseIp(raw: string): ParsedIp | null {
+  let text = raw;
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(text);
+  if (bracketed) {
+    text = bracketed[1]!;
+  } else {
+    const withPort = /^([\d.]+):\d{1,5}$/.exec(text);
+    if (withPort) text = withPort[1]!;
+  }
+  const zone = text.indexOf('%');
+  if (zone !== -1) text = text.slice(0, zone);
+
+  if (netIsIPv4(text)) return { version: 4, value: ipv4ToBigInt(text) };
+  const v6 = ipv6ToBigInt(text);
+  if (v6 === null) return null;
+  if (v6 >> 32n === 0xffffn) return { version: 4, value: v6 & 0xffffffffn };
+  return { version: 6, value: v6 };
+}
+
+function formatIp({ version, value }: ParsedIp): string {
+  const count = version === 4 ? 4 : 8;
+  const size = version === 4 ? 8n : 16n;
+  const mask = (1n << size) - 1n;
+  const parts: string[] = [];
+  for (let i = count - 1; i >= 0; i--) {
+    const part = (value >> (BigInt(i) * size)) & mask;
+    parts.push(version === 4 ? part.toString(10) : part.toString(16));
+  }
+  return parts.join(version === 4 ? '.' : ':');
+}
+
+// ---------- levels ----------
+
+function widthOf(version: 4 | 6): number {
+  return version === 4 ? 32 : 128;
+}
+
+function keepLeadingBits(ip: ParsedIp, keep: number): string {
+  const drop = BigInt(widthOf(ip.version) - keep);
+  return formatIp({ version: ip.version, value: (ip.value >> drop) << drop });
+}
+
+/**
+ * Keyed permutation of `bits`-bit integers (a small Feistel network). Every
+ * input maps to a different output, so distinct visitors in one block keep
+ * distinct stand-ins. `tweak` gives each block its own shuffle.
+ */
+function shuffle(key: Buffer, tweak: string, value: bigint, bits: number): bigint {
+  let a = Math.floor(bits / 2);
+  let b = bits - a;
+  let left = value >> BigInt(b);
+  let right = value & ((1n << BigInt(b)) - 1n);
+  for (let round = 0; round < 4; round++) {
+    const digest = createHmac('sha256', key)
+      .update(`${tweak}/${round}/${right}`)
+      .digest();
+    const f = digest.readBigUInt64BE(0);
+    [left, right] = [right, (left ^ f) & ((1n << BigInt(a)) - 1n)];
+    [a, b] = [b, a];
+  }
+  return (left << BigInt(b)) | right;
+}
+
+function geoHash(ip: ParsedIp, key: Buffer): string {
+  const width = widthOf(ip.version);
+  const keep = ip.version === 4 ? GEO_KEEP_V4 : GEO_KEEP_V6;
+  const shuffled = (ip.version === 4 ? 32 : 64) - keep;
+  const zeroed = BigInt(width - keep - shuffled);
+  const block = ip.value >> BigInt(width - keep);
+  const middle = (ip.value >> zeroed) & ((1n << BigInt(shuffled)) - 1n);
+  const mixed = shuffle(key, `${ip.version}:${block}`, middle, shuffled);
+  return formatIp({
+    version: ip.version,
+    value: (block << BigInt(width - keep)) | (mixed << zeroed),
+  });
 }
 
 /**
@@ -126,11 +209,17 @@ function geoHashIPv6(ip: string, salt: string, rotationSalt: string): string {
  * - `drop`: returns null (caller should omit the IP)
  * - `mask24`: zeroes the last octet (IPv4) or last 5 groups (IPv6 /48)
  * - `mask16`: zeroes the last two octets (IPv4) or last 4 groups (IPv6 /64)
- * - `hash`: returns an opaque rotating hash (no geo info)
- * - `geo-hash`: keeps coarse geo info, randomizes the rest with a rotating salt
+ * - `hash`: returns an opaque hash (no geo info)
+ * - `geo-hash`: keeps the first 19 bits of IPv4 or 28 bits of IPv6 for a
+ *   rough location and shuffles the rest into a stand-in address
  *
- * For hashing levels (`hash`, `geo-hash`), `salt` is required. Rotation defaults
- * to `daily` so the same IP maps to a different hash each day.
+ * The hashing levels (`hash`, `geo-hash`) use a random key that lives only in
+ * memory and is replaced every `rotation` period (default `daily`, in UTC).
+ * The same address gives the same result within a period, so analytics
+ * sessions still work. Once the period's key is gone, no one can map its
+ * results back to a real address.
+ *
+ * Every level except `none` returns null for input that is not an IP address.
  */
 export function anonymizeIp(
   ip: string | null | undefined,
@@ -144,33 +233,22 @@ export function anonymizeIp(
   if (level === 'drop') return null;
   if (level === 'none') return trimmed;
 
-  const v4 = isIPv4(trimmed);
-  const v6 = !v4 && isIPv6(trimmed);
-  if (!v4 && !v6) return trimmed;
+  const parsed = parseIp(trimmed);
+  if (!parsed) return null;
 
   if (level === 'mask24') {
-    return v4 ? maskIPv4(trimmed, 3) : maskIPv6(trimmed, 3);
+    return keepLeadingBits(parsed, parsed.version === 4 ? 24 : 48);
   }
   if (level === 'mask16') {
-    return v4 ? maskIPv4(trimmed, 2) : maskIPv6(trimmed, 4);
-  }
-
-  const salt = options.salt;
-  if (!salt) {
-    throw new Error(
-      `anonymizeIp: level "${level}" requires a non-empty salt. ` +
-        'Set IP_HASH_SALT in the environment or pass salt in config.'
-    );
+    return keepLeadingBits(parsed, parsed.version === 4 ? 16 : 64);
   }
 
   const rotation = options.rotation ?? 'daily';
   const now = (options.now ?? (() => new Date()))();
-  const rotationSalt = rotationKey(rotation, now);
+  const key = keyFor(rotation, now);
 
   if (level === 'hash') {
-    return hashIp(trimmed, salt, rotationSalt);
+    return createHmac('sha256', key).update(formatIp(parsed)).digest('hex');
   }
-  return v4
-    ? geoHashIPv4(trimmed, salt, rotationSalt)
-    : geoHashIPv6(trimmed, salt, rotationSalt);
+  return geoHash(parsed, key);
 }

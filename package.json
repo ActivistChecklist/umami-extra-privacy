@@ -1,6 +1,6 @@
 {
   "name": "@activistchecklist/umami-extra-privacy",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Server-side relay for Umami analytics with configurable IP anonymization. Drop-in handlers for Fastify, Next.js, and any Node HTTP framework.",
   "license": "MIT",
   "repository": {
