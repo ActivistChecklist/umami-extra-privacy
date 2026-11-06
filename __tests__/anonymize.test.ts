@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { describe, it, expect, vi } from 'vitest';
 import { anonymizeIp } from '../src/anonymize.js';
 
@@ -236,6 +236,57 @@ describe('anonymizeIp', () => {
     it('still passes junk through unchanged at level=none', () => {
       expect(anonymizeIp('not-an-ip', { level: 'none' })).toBe('not-an-ip');
     });
+  });
+});
+
+describe('how much geo-hash trims', () => {
+  // For each bit position (0 = leftmost), the share of addresses whose
+  // stand-in differs from the real address at that bit. A kept bit never
+  // differs. A trimmed bit is replaced with a key-dependent bit, so it differs
+  // about half the time, like a coin flip.
+  function flipRates(pairs: [bigint, bigint][], width: number): number[] {
+    const rates: number[] = [];
+    for (let bit = 0; bit < width; bit++) {
+      const shift = BigInt(width - 1 - bit);
+      const flips = pairs.filter(([real, out]) => ((real ^ out) >> shift) & 1n).length;
+      rates.push(flips / pairs.length);
+    }
+    return rates;
+  }
+  const toBigInt = (parts: string[], size: bigint, radix: number) =>
+    parts.reduce((acc, p) => (acc << size) | BigInt(parseInt(p, radix)), 0n);
+  const SAMPLES = 4000;
+
+  it('IPv4: keeps bits 0-18 and replaces every one of bits 19-31', () => {
+    const pairs: [bigint, bigint][] = [];
+    for (let i = 0; i < SAMPLES; i++) {
+      const ip = [...randomBytes(4)].join('.');
+      const out = anonymizeIp(ip, { level: 'geo-hash', now: fixedNow })!;
+      pairs.push([toBigInt(ip.split('.'), 8n, 10), toBigInt(out.split('.'), 8n, 10)]);
+    }
+    const rates = flipRates(pairs, 32);
+    expect(rates.slice(0, 19)).toEqual(Array(19).fill(0));
+    for (const rate of rates.slice(19)) {
+      expect(rate).toBeGreaterThan(0.4);
+      expect(rate).toBeLessThan(0.6);
+    }
+  });
+
+  it('IPv6: keeps bits 0-27, replaces every one of bits 28-63 and zeroes bits 64-127', () => {
+    const pairs: [bigint, bigint][] = [];
+    for (let i = 0; i < SAMPLES; i++) {
+      const groups = randomBytes(16).toString('hex').match(/.{4}/g)!;
+      const out = anonymizeIp(groups.join(':'), { level: 'geo-hash', now: fixedNow })!;
+      const outValue = toBigInt(out.split(':'), 16n, 16);
+      expect(outValue & ((1n << 64n) - 1n)).toBe(0n);
+      pairs.push([toBigInt(groups, 16n, 16), outValue]);
+    }
+    const rates = flipRates(pairs, 64 + 64).slice(0, 64);
+    expect(rates.slice(0, 28)).toEqual(Array(28).fill(0));
+    for (const rate of rates.slice(28)) {
+      expect(rate).toBeGreaterThan(0.4);
+      expect(rate).toBeLessThan(0.6);
+    }
   });
 });
 
