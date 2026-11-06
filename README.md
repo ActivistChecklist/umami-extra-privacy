@@ -35,7 +35,20 @@ This package is not published to npm. Use a Git dependency:
 }
 ```
 
-Pin to a commit SHA so a renamed branch can't silently change your dep.
+Pin to the full SHA of a commit on `main` (each release is also tagged
+`vX.Y.Z`) so a renamed branch can't silently change your dep. Don't pin a
+PR-branch commit: PRs are squash-merged, so it never lands on `main`.
+
+The package builds itself with a `prepare` script when it installs. pnpm 10
+and later skip dependency build scripts unless you allow them, and then
+`dist/` is missing. pnpm 12 also wants the allowance to name the exact
+tarball, so update it with every new SHA:
+
+```yaml
+# pnpm-workspace.yaml
+allowBuilds:
+  "@activistchecklist/umami-extra-privacy@https://codeload.github.com/ActivistChecklist/umami-extra-privacy/tar.gz/<commit-sha>": true
+```
 
 ## Configuration (env)
 

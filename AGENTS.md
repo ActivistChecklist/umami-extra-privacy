@@ -59,16 +59,16 @@ chore(deps): bump tsup to 8.4.0
 feat!: change default anonymization level to 'mask24'
 ```
 
-### When to bump the version
+## Releasing a change
 
-After merging changes to `main`, bump `version` in `package.json` according to the highest-impact commit since the last bump:
+This package is not on npm and is never published there. Consumers install it from GitHub by commit SHA, so a release is a commit on `main` plus a tag. There is no CI in this repo: the local checks below are the only gate.
 
-* Any `feat!:` or `BREAKING CHANGE:` → major
-* Otherwise any `feat:` → minor
-* Otherwise any `fix:` / `perf:` → patch
-* Docs/chore/refactor only → no bump needed
-
-Commit the version bump as `chore(release): vX.Y.Z` and tag it: `git tag vX.Y.Z && git push --tags`. Consumers update by changing the pinned SHA in their own `package.json` to the new tag's commit.
+1. On a `dev/NAME` branch, make the change and bump `version` in `package.json` in the same PR, using the table above for the highest-impact commit since the last tag (`git log "$(git describe --tags --abbrev=0)"..HEAD --oneline`). Never bump the version in a separate commit straight to `main`.
+2. Run `pnpm test`, `pnpm typecheck` and `pnpm build`. Consumers run `prepare` (tsup) when they install, so a broken build breaks their install.
+3. Open a PR whose title is the conventional commit title, and squash-merge it. The squash commit is the release.
+4. Get the full 40-character SHA of that commit on `main`: `git fetch origin && git rev-parse origin/main`. Never hand out a PR-branch commit: the squash makes a new commit, and the branch commit is not on `main` and can disappear once the branch is deleted.
+5. Tag it and push the tag: `git tag vX.Y.Z <sha> && git push origin vX.Y.Z`.
+6. Give consumers the full SHA. ActivistChecklist's steps for picking it up are in that repo's `AGENTS.md` ("Updating umami-extra-privacy"). A change only reaches a running site after the consumer re-pins, deploys and restarts its API process.
 
 ## Testing rules
 
